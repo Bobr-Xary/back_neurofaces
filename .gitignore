@@ -1,0 +1,117 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.conda/
+.pyenv/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit tests / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.env
+.env.*
+!.env.example
+.envrc
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs & PIDs
+*.log
+*.pid
+*.pid.lock
+
+# Local DBs
+*.db
+*.sqlite3
+*.sqlite
+
+# Runtime/media artifacts
+debug_frames/
+alerts/raw/
+alerts/faces/
+out/
+tmp/
+uploads/
+media/
+staticfiles/
+
+# ML weights / large artifacts
+*.onnx
+*.pth
+*.pt
+*.bin
+*.pb
+*.h5
+
+# Alembic cache (keep versions themselves)
+alembic/versions/__pycache__/
+
+# Legacy local configs with secrets (если есть)
+config.py
+app/core/local_settings.py
+
+# Docker local data
+docker-data/
+
+not_used/
+debug_best_frames/
+gfpgan/
+scripts/
+migrations/
+image.png
+GFPGAN/
+INTEGRATION_SERVER_PATCH.txt
+launc.txt
+osint.py
+requirements.txt.bak
+trash/
