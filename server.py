@@ -56,7 +56,7 @@ app.include_router(rbac_api_router, prefix="/api/v1")
 from app.api.v1.routes import admin_users, admin_devices  
 app.include_router(admin_users.router)                     
 app.include_router(admin_devices.router)        
-           
+
 @app.on_event("startup")
 async def on_startup():
     global _background_face_task
@@ -237,55 +237,20 @@ async def _process_frame_and_collect_result_enriched(
     lat: Optional[float] = None, lon: Optional[float] = None, address: Optional[str] = None,
     extra_meta: Optional[Dict[str, Any]] = None
 ) -> dict:
+    # 1) вытащили лица
     face_result = await run_in_threadpool(face_recognizer.process_image, raw_bytes)
+    # 2) сложили в буфер (атомарно)
     if face_result != []:
-        for face_data in face_result:
-            embedding = face_data.get("embedding")
-            face_img = face_data.get("face")   # BGR
-            face_id = face_data.get("face_id")
-            if embedding is None or face_img is None or face_id is None:
-                continue
-            emotion_tracker.update_face(face_id, face_img, raw_bytes=raw_bytes, frame_ts=time.time())
-
-    ready_faces = emotion_tracker.get_ready_buffers_enriched()
-    result = {}
-    for face_id, best_img, best_raw, ts_sec in ready_faces:
-        emotion = await run_in_threadpool(analyze_emotions, best_img)
-        alert_info = None
-        if isinstance(emotion, dict):
-            try:
-                score = float(emotion.get("aggression_score", 0))
-            except Exception:
-                score = 0.0
-            if score > 1:
-                captured_dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc) if ts_sec else None
-                alert_info = create_alert_record(
-                    original_bytes=best_raw or raw_bytes,   # ВАЖНО: raw из того же сэмпла, что и кроп
-                    face_bgr=best_img,
-                    device_id=device_id,
-                    user_id=user_id,
-                    face_id=face_id,
-                    emotion=emotion,
-                    meta={"source": source, **(extra_meta or {})},
-                    lat=lat, lon=lon, address=address,
-                    label="aggression",
-                    captured_at=captured_dt,
-                )
-        logger.info("Emotion for %s: %s", face_id, emotion)
-        result[face_id] = {"emotion": emotion, "profile": "anime"}
-        # уведомления (с alert_id и ссылками если есть)
-        if isinstance(emotion, dict):
-            await maybe_notify_alert(
-                source=source, face_id=face_id, emotion=emotion,
-                alert_id=alert_info.get("id") if alert_info else None,
-                raw_url=alert_info.get("raw_url") if alert_info else None,
-                face_url=alert_info.get("face_url") if alert_info else None,
-                meta=extra_meta,
-            )
-
-    if result: emotion_tracker.cleanup()
-    else: logger.warning("Лицо не найдено или нераспознано.")
-    return to_serializable(result)
+        async with emotion_buf_lock:
+            for face_data in face_result:
+                embedding = face_data.get("embedding")
+                face_img = face_data.get("face")   # BGR
+                face_id = face_data.get("face_id")
+                if embedding is None or face_img is None or face_id is None:
+                    continue
+                emotion_tracker.update_face(face_id, face_img, raw_bytes=raw_bytes, frame_ts=time.time())
+    # 3) ничего не считаем, не чистим — это сделает фон
+    return {}
 
 def _strip_data_url_prefix(b64txt: str) -> str:
     # убираем 'data:image/jpeg;base64,' если прилетает data URL
@@ -399,74 +364,17 @@ known_faces = {}  # Хранилище эмбеддингов для идент�
 
 # -------------------- ОБЩАЯ ОБРАБОТКА КАДРА --------------------
 async def _process_frame_and_collect_result(raw_bytes: bytes, source: str) -> dict:
-    """
-    Вызов конвейера: распознавание лица -> буфер -> эмоции.
-    Возвращает dict {face_id: {emotion, profile}} или {}.
-    Параллельно — отправка уведомлений при превышении порога.
-    """
-    # распознавание лица (совместимо с FaceRecognizer.process_image)
     face_result = await run_in_threadpool(face_recognizer.process_image, raw_bytes)
     if face_result != []:
-        for face_data in face_result:
-            embedding = face_data.get("embedding")
-            face_img = face_data.get("face")   # обрезанное лицо (BGR)
-            face_id = face_data.get("face_id")
-            if embedding is None or face_img is None or face_id is None:
-                continue
-            emotion_tracker.update_face(face_id, face_img, raw_bytes=raw_bytes, frame_ts=time.time())
-
-
-    # проверяем готовые буферы и анализируем эмоции
-    ready_faces = emotion_tracker.get_ready_buffers_enriched()
-    result = {}
-    for face_id, best_img, best_raw, ts_sec in ready_faces:
-        emotion = await run_in_threadpool(analyze_emotions, best_img)
-        emotion = await run_in_threadpool(analyze_emotions, best_img)
-
-        alert_info = None
-        if isinstance(emotion, dict):
-            try:
-                score = float(emotion.get("aggression_score", 0))
-            except Exception:
-                score = 0.0
-            if score > 1:
-                captured_dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc) if ts_sec else None
-                alert_info = create_alert_record(
-                    original_bytes=best_raw or raw_bytes,   # ВАЖНО: raw из того же сэмпла
-                    face_bgr=best_img,
-                    device_id=None,
-                    user_id=None,
-                    face_id=face_id,
-                    emotion=emotion,
-                    meta={"source": source},
-                    lat=None, lon=None, address=None,
-                    label="aggression",
-                    captured_at=captured_dt,
-                )
-
-        logger.info("Emotion for %s: %s", face_id, emotion)
-        result[face_id] = {
-            "emotion": emotion,
-            "profile": "anime"
-        }
-
-        # уведомления (если был создан alert)
-        if isinstance(emotion, dict):
-            await maybe_notify_alert(
-                source=source, face_id=face_id, emotion=emotion,
-                alert_id=alert_info.get("id") if alert_info else None,
-                raw_url=alert_info.get("raw_url") if alert_info else None,
-                face_url=alert_info.get("face_url") if alert_info else None,
-                meta=None,
-            )
-
-    if result:
-        # очищаем после успешной отправки
-        emotion_tracker.cleanup()
-    else:
-        logger.warning("Лицо не найдено или нераспознано.")
-
-    return to_serializable(result)
+        async with emotion_buf_lock:
+            for face_data in face_result:
+                embedding = face_data.get("embedding")
+                face_img = face_data.get("face")   # обрезанное лицо (BGR)
+                face_id = face_data.get("face_id")
+                if embedding is None or face_img is None or face_id is None:
+                    continue
+                emotion_tracker.update_face(face_id, face_img, raw_bytes=raw_bytes, frame_ts=time.time())
+    return {}
 
 
 # -------------------- ВЕБСОКЕТ: BASE64-ТЕКСТ (/ws) --------------------
