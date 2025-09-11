@@ -7,7 +7,7 @@ from app.api.v1.devices import router as devices_router
 
 # добавить ЭТИ:
 from app.api.v1.ingest import router as ingest_router
-from app.api.v1.alerts import router as alerts_router
+#from trash.alerts import router as alerts_router
 from app.api.v1.media import router as media_router
 from app.api.v1.admin_settings import router as admin_settings_router
 from app.api.v1.alerts_ext import router as alerts_ext_router

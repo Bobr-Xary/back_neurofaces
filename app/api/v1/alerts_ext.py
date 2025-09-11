@@ -17,7 +17,7 @@ def list_alerts(
     db: Session = Depends(get_db),
     limit: int = Query(100, ge=1, le=500),
     since: Optional[str] = Query(None, description="ISO datetime; return alerts since this time"),
-    include_hidden: bool = Query(False, description="Admin-only: include hidden alerts"),
+    include_hidden: bool = Query(False, description="Admin-only: include hidden alerts (ignored for admin — admin sees all)"),
 ):
     uid = str(user.id)
 
@@ -30,42 +30,58 @@ def list_alerts(
     is_citizen = role_str in ("citizen", "user")
 
     params = {"uid": uid, "limit": limit}
-    time_filter = ""
     if since:
-        time_filter = f" AND {_time_expr()} >= :since"
         params["since"] = since
 
     # join’ы для владения и ACL
-    join = (
+    join_sql = (
         "LEFT JOIN devices d ON d.id = a.device_id "
         "LEFT JOIN alert_access aa ON aa.alert_id = a.id AND aa.user_id = :uid"
     )
 
-    # ВАЖНО: берем только реально существующие колонки (raw_path/face_path)
+    # Базовый SELECT: берём только реально существующие колонки (raw_path/face_path)
     base_select = [
         "a.id", "a.severity", "a.label", "a.device_id", "a.user_id",
         "a.lat", "a.lon", "a.address",
         "a.emotion", "a.meta",
         "a.raw_path", "a.face_path",
+        "a.hidden",
         f"{_time_expr()} AS ts",
         "d.owner_user_id AS owner_user_id",
         "(d.owner_user_id = :uid) AS is_owner",
+        "(a.user_id = :uid) AS is_creator",      # <-- офицер-инициатор
         "aa.can_view_face AS can_view_face",
     ]
 
-    if is_admin:
-        where = "" if include_hidden else "WHERE COALESCE(a.hidden,false)=false"
-    else:
-        where = "WHERE COALESCE(a.hidden,false)=false AND (d.owner_user_id = :uid OR aa.user_id IS NOT NULL)"
+    # WHERE-условия собираем списком
+    where_clauses: List[str] = []
+
+    if not is_admin:
+        # не-админам скрытые НЕ показываем
+        where_clauses.append("COALESCE(a.hidden, false) = false")
+
+        if is_officer:
+            # офицер видит: свои девайсы, расшаренные, ИЛИ свои (где он создатель)
+            where_clauses.append("(d.owner_user_id = :uid OR aa.user_id IS NOT NULL OR a.user_id = :uid)")
+        else:
+            # citizen: свои девайсы или расшаренные (как раньше)
+            where_clauses.append("(d.owner_user_id = :uid OR aa.user_id IS NOT NULL)")
+
+    # для админа — без ограничений по hidden/владению
+    if since:
+        where_clauses.append(f"{_time_expr()} >= :since")
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
 
     sql = f"""
         SELECT {', '.join(base_select)}
-        FROM alerts a
-        {join}
-        {where}
-        {time_filter}
-        ORDER BY {_time_expr()} DESC
-        LIMIT :limit
+          FROM alerts a
+          {join_sql}
+          {where_sql}
+         ORDER BY {_time_expr()} DESC
+         LIMIT :limit
     """
 
     rows = db.execute(text(sql), params).mappings().all()
@@ -79,14 +95,16 @@ def list_alerts(
         raw_url = f"/api/v1/media/alerts/{raw_rel}" if raw_rel else None
         face_url = f"/api/v1/media/alerts/{face_rel}" if face_rel else None
 
-        is_owner = bool(r.get("is_owner"))
+        is_owner    = bool(r.get("is_owner"))
+        is_creator  = bool(r.get("is_creator"))
         acl_can_face = r.get("can_view_face")  # None/True/False
 
         # Права на лицо по ролям
         if is_admin:
             can_face = True
         elif is_officer:
-            can_face = True if is_owner else bool(acl_can_face)
+            # офицер видит лицо, если он владелец девайса ИЛИ создатель, иначе по ACL
+            can_face = True if (is_owner or is_creator) else bool(acl_can_face)
         elif is_citizen:
             can_face = bool(acl_can_face)
         else:
@@ -116,6 +134,7 @@ def list_alerts(
             "ts_utc": r["ts"].isoformat() if r["ts"] else None,
             "raw_url": raw_url,
             "face_url": face_url,
+            "hidden": bool(r.get("hidden")),
         })
     return out
 
@@ -140,26 +159,55 @@ def share_alert(
     return {"ok": True}
 
 @router.post("/{alert_id}/hide")
-def hide_alert(
+def toggle_hide_alert(
     alert_id: str,
-    payload: HideAlertRequest,
-    user=Depends(get_current_user),
+    payload: Optional[HideAlertRequest] = None,
+    user = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     role_raw = getattr(user, "role", None)
     role_str = getattr(role_raw, "value", role_raw)
     if str(role_str).lower() != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
-    db.execute(text("UPDATE alerts SET hidden = :hidden WHERE id = :aid"),
-               {"hidden": bool(payload.hidden), "aid": alert_id})
-    if payload.reason:
+
+    row = db.execute(
+        text("SELECT hidden, meta FROM alerts WHERE id = :aid FOR UPDATE"),
+        {"aid": alert_id}
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    current_hidden = bool(row.get("hidden"))
+    new_hidden = not current_hidden
+    reason = (payload.reason.strip() if payload and payload.reason else None)
+
+    # meta-обновление: при скрытии — пишем hidden_reason; при показе — удаляем
+    if new_hidden:
+        # скрываем
         db.execute(text("""
             UPDATE alerts
-               SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('hidden_reason', :r)
+               SET hidden = TRUE,
+                   meta = COALESCE(meta, '{}'::jsonb) || CASE
+                        WHEN :r IS NOT NULL THEN jsonb_build_object('hidden_reason', :r)
+                        ELSE '{}'::jsonb
+                   END
              WHERE id = :aid
-        """), {"r": payload.reason, "aid": alert_id})
+        """), {"aid": alert_id, "r": reason})
+    else:
+        # делаем видимым + чистим hidden_reason
+        db.execute(text("""
+            UPDATE alerts
+               SET hidden = FALSE,
+                   meta = CASE
+                            WHEN meta ? 'hidden_reason'
+                              THEN meta - 'hidden_reason'
+                            ELSE meta
+                         END
+             WHERE id = :aid
+        """), {"aid": alert_id})
+
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "hidden": new_hidden, "reason": reason if new_hidden else None}
 
 @router.get("/map")
 def alerts_map(
@@ -169,30 +217,33 @@ def alerts_map(
     precision: int = Query(3, ge=1, le=4, description="Rounding precision for lat/lon bins"),
     limit: int = Query(1000, ge=10, le=10000),
 ):
+    # карта — только для админа
     role_raw = getattr(user, "role", None)
     role_str = getattr(role_raw, "value", role_raw)
     if str(role_str).lower() != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
     params = {"limit": limit}
-    since_sql = ""
+    where_clauses = ["a.lat IS NOT NULL", "a.lon IS NOT NULL"]
+
     if since:
-        since_sql = f" AND {_time_expr()} >= :since"
         params["since"] = since
+        where_clauses.append(f"{_time_expr()} >= :since")
+
+    where_sql = "WHERE " + " AND ".join(where_clauses)
+
     sql = text(f"""
-        SELECT ROUND(a.lat::numeric, :prec) AS lat_bin,
-               ROUND(a.lon::numeric, :prec) AS lon_bin,
+        SELECT ROUND(a.lat::numeric, {precision}) AS lat_bin,
+               ROUND(a.lon::numeric, {precision}) AS lon_bin,
                AVG(a.severity) AS severity_avg,
                COUNT(*) AS cnt,
                MAX({_time_expr()}) AS last_ts
           FROM alerts a
-         WHERE a.lat IS NOT NULL AND a.lon IS NOT NULL
-           AND COALESCE(a.hidden,false)=false
-           {since_sql}
+          {where_sql}
          GROUP BY 1,2
          ORDER BY last_ts DESC
          LIMIT :limit
-    """.replace(":prec", str(precision)))
+    """)
     rows = db.execute(sql, params).mappings().all()
     return [{
         "lat": float(r["lat_bin"]),
