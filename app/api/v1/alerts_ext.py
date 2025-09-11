@@ -60,12 +60,11 @@ def list_alerts(
         # не-админам скрытые НЕ показываем
         where_clauses.append("COALESCE(a.hidden, false) = false")
 
-        if is_officer:
-            # офицер видит: свои девайсы, расшаренные, ИЛИ свои (где он создатель)
+        if not is_admin:
+            where_clauses.append("COALESCE(a.hidden, false) = false")
+            # и офицерам, и гражданским — показываем:
+            # 1) свои девайсы  2) расшаренные  3) созданные ими
             where_clauses.append("(d.owner_user_id = :uid OR aa.user_id IS NOT NULL OR a.user_id = :uid)")
-        else:
-            # citizen: свои девайсы или расшаренные (как раньше)
-            where_clauses.append("(d.owner_user_id = :uid OR aa.user_id IS NOT NULL)")
 
     # для админа — без ограничений по hidden/владению
     if since:

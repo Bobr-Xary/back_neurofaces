@@ -21,6 +21,7 @@ def list_devices(
         {
             "id": str(d.id),
             "name": getattr(d, "name", None),
+            "owner_user_id":getattr(d, "owner_user_id", None),
             "uid": getattr(d, "uid", None) or getattr(d, "device_uid", None),
             "created_at": getattr(d, "created_at", None).isoformat() if getattr(d, "created_at", None) else None,
             "is_active": getattr(d, "is_active", True),
