@@ -10,6 +10,9 @@ from app.db.session import get_db
 from app.core.deps import get_current_device
 from app.schemas.alert import AlertIngestRequest, AlertOut
 from app.services.alerts_service import create_alert
+from app.services.alert_acl import grant_alert_access
+from app.models.user import User
+from app.models.enums import UserRole
 from app.utils.media import save_b64_image
 
 # existing pipeline
@@ -97,4 +100,10 @@ def ingest_frame(payload: AlertIngestRequest, db: Session = Depends(get_db), dev
         image_face_path=face_img_path,
         meta=payload.meta or {},
     )
+    owner_id = str(device.owner_user_id) if device.owner_user_id else None
+    if owner_id:
+        owner_role = db.query(User).filter(User.id == device.owner_user_id).with_entities(User.role).scalar()
+        can_face = (owner_role == UserRole.officer)
+        grant_alert_access(db, str(alert.id), owner_id, can_view_face=can_face)
+    db.commit()
     return alert

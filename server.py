@@ -14,7 +14,10 @@ import uuid
 from typing import Optional, Dict, Any
 import os
 from datetime import datetime, timezone
+from app.db.session import SessionLocal
+from sqlalchemy import text
 from starlette.websockets import WebSocketDisconnect, WebSocketState
+import contextlib
 
 from starlette.staticfiles import StaticFiles
 from face_recognizer_insightface import FaceRecognizer
@@ -35,6 +38,8 @@ ALERT_NOTIFY_THRESHOLD = int(settings.ALERT_NOTIFY_THRESHOLD)
 ALERTS_DIR = Path(os.getenv("ALERTS_DIR", "alerts")).resolve()
 ALERTS_DIR.mkdir(parents=True, exist_ok=True)
 
+FACE_CTX: dict[str, dict[str, Any]] = {}
+
 app = FastAPI()
 
 app.add_middleware(
@@ -42,7 +47,8 @@ app.add_middleware(
     protected_paths={"/ws/alerts"},    # можно расширять множеством путей
     # allowed_roles по умолчанию {"admin", "officer"}; см. app/middleware/ws_auth.py
 )
-app.mount("/alerts", StaticFiles(directory=str(ALERTS_DIR)), name="alerts-static")
+# ВАЖНО: публичную статику /alerts не монтируем — фото только через защищённый /api/v1/media/alerts
+# app.mount("/alerts", StaticFiles(directory=str(ALERTS_DIR)), name="alerts-static")
 
 face_recognizer = FaceRecognizer()
 emotion_tracker = FaceTracker()  # Инициализируем трекер эмоций
@@ -53,9 +59,9 @@ _background_face_task: asyncio.Task | None = None
 # API (RBAC/ingest/alerts) смонтированы через общий роутер
 from app.api.v1.router import api_router as rbac_api_router
 app.include_router(rbac_api_router, prefix="/api/v1")
-from app.api.v1.routes import admin_users, admin_devices  
-app.include_router(admin_users.router)                     
-app.include_router(admin_devices.router)        
+from app.api.v1.routes import admin_users, admin_devices
+app.include_router(admin_users.router)
+app.include_router(admin_devices.router)
 
 @app.on_event("startup")
 async def on_startup():
@@ -65,23 +71,84 @@ async def on_startup():
         logger.info("Background face worker started")
 
 @app.on_event("shutdown")
-def shutdown_event():
-    face_recognizer.close()
-    # остановим фонового воркера
-    global _background_face_task
+def on_shutdown():
+    # Корректно закрываем ресурсы
     try:
-        if _background_face_task:
-            _background_face_task.cancel()
+        face_recognizer.close()
     except Exception:
         pass
-
+    global _background_face_task
+    with contextlib.suppress(Exception):
+        if _background_face_task:
+            _background_face_task.cancel()
 
 
 # -------------------- УТИЛИТЫ --------------------
+def _enrich_alert_payload_from_db(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Если есть alert_id — добираем user_id/device_id/lat/lon/address/raw/face из БД.
+    Ссылки на медиа приводим к защищённому endpoint.
+    Если alerts.user_id пуст, подставляем owner_user_id из devices.
+    Если lat/lon пусты, пробуем достать из meta.
+    """
+    alert_id = payload.get("alert_id")
+    if not alert_id:
+        return payload
+
+    db = SessionLocal()
+    try:
+        row = db.execute(text("""
+            SELECT a.id, a.device_id, a.user_id, a.lat, a.lon, a.address, a.raw_path, a.face_path, a.meta,
+                   d.owner_user_id
+              FROM alerts a
+              LEFT JOIN devices d ON d.id = a.device_id
+             WHERE a.id = :aid
+        """), {"aid": alert_id}).mappings().first()
+        if not row:
+            return payload
+
+        # device_id
+        if payload.get("device_id") is None:
+            payload["device_id"] = str(row["device_id"]) if row.get("device_id") else None
+
+        # user_id (fallback на owner_user_id)
+        user_id_db = row.get("user_id") or row.get("owner_user_id")
+        if payload.get("user_id") is None:
+            payload["user_id"] = str(user_id_db) if user_id_db else None
+
+        # geo
+        lat_db, lon_db = row.get("lat"), row.get("lon")
+        if (lat_db is None or lon_db is None) and row.get("meta"):
+            try:
+                m = row["meta"] or {}
+                lat_db = lat_db if lat_db is not None else m.get("lat")
+                lon_db = lon_db if lon_db is not None else m.get("lon")
+                if payload.get("address") is None and m.get("address"):
+                    payload["address"] = m.get("address")
+            except Exception:
+                pass
+        if payload.get("lat") is None:
+            payload["lat"] = lat_db
+        if payload.get("lon") is None:
+            payload["lon"] = lon_db
+        if payload.get("address") is None:
+            payload["address"] = row.get("address")
+
+        # медиа → защищённые урлы
+        if not payload.get("raw_url") and row.get("raw_path"):
+            payload["raw_url"] = f"/api/v1/media/alerts/{row['raw_path']}"
+        if not payload.get("face_url") and row.get("face_path"):
+            payload["face_url"] = f"/api/v1/media/alerts/{row['face_path']}"
+
+        return payload
+    finally:
+        db.close()
+
 async def _background_face_worker():
     """
     Периодически вынимаем из FaceTracker готовые пары (crop+raw),
     считаем эмоции, создаём алерты и шлём уведомления — без привязки к WS.
+    user_id/device_id здесь нет — это фоновые алерты (meta.source='bg_worker').
     """
     CHECK_INTERVAL_SEC = 0.5  # как часто проверять буфер
     while True:
@@ -108,14 +175,22 @@ async def _background_face_worker():
                         score = 0.0
                     if score > 1:
                         captured_dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc) if ts_sec else None
+                        ctx = FACE_CTX.get(str(face_id), {}) or {}
+                        ctx_device_id = ctx.get("device_id")
+                        ctx_user_id   = ctx.get("user_id")
+                        ctx_lat       = ctx.get("lat")
+                        ctx_lon       = ctx.get("lon")
+                        ctx_address   = ctx.get("address")
+                        ctx_meta      = ctx.get("meta") or {}
                         alert_info = create_alert_record(
                             original_bytes=best_raw or b"",
                             face_bgr=best_img,
-                            device_id=None, user_id=None,
+                            device_id=ctx_device_id,        # ← вместо None
+                            user_id=ctx_user_id,            # ← вместо None
                             face_id=face_id,
                             emotion=emotion,
-                            meta={"source": "bg_worker"},
-                            lat=None, lon=None, address=None,
+                            meta={"source": "bg_worker", **ctx_meta},  # сохраняем и источник, и клиентский meta
+                            lat=ctx_lat, lon=ctx_lon, address=ctx_address,
                             label="aggression",
                             captured_at=captured_dt,
                         )
@@ -124,11 +199,18 @@ async def _background_face_worker():
                             alert_id=alert_info.get("id") if alert_info else None,
                             raw_url=alert_info.get("raw_url") if alert_info else None,
                             face_url=alert_info.get("face_url") if alert_info else None,
-                            meta=None,
+                            meta=ctx_meta,
+                            device_id=ctx_device_id,
+                            user_id=ctx_user_id,
+                            lat=ctx_lat, lon=ctx_lon, address=ctx_address,
                         )
                 # после обработки — подчистка буфера (если ваш FaceTracker не чистит точечно)
                 async with emotion_buf_lock:
-                    emotion_tracker.cleanup()
+                    with contextlib.suppress(Exception):
+                        emotion_tracker.cleanup()
+        except asyncio.CancelledError:
+            # корректно выходим по cancel()
+            break
         except Exception:
             logger.exception("background face worker failed")
         await asyncio.sleep(CHECK_INTERVAL_SEC)
@@ -212,10 +294,12 @@ async def _flush_pending_buffers(
                     raw_url=alert_info.get("raw_url") if alert_info else None,
                     face_url=alert_info.get("face_url") if alert_info else None,
                     meta=extra_meta,
+                    device_id=device_id, user_id=user_id, lat=lat, lon=lon, address=address
                 )
 
     # очищаем буфер после форс-обработки
-    emotion_tracker.cleanup()
+    with contextlib.suppress(Exception):
+        emotion_tracker.cleanup()
 
 def _guess_ext(raw: bytes) -> str:
     if raw.startswith(b"\xff\xd8\xff"):   # JPEG
@@ -225,12 +309,13 @@ def _guess_ext(raw: bytes) -> str:
     return ".bin"
 
 def _decode_token(token: Optional[str]) -> Optional[dict]:
-    if not token: return None
+    if not token:
+        return None
     try:
         return jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
     except JWTError:
         return None
-    
+
 async def _process_frame_and_collect_result_enriched(
     raw_bytes: bytes, source: str,
     device_id: Optional[str] = None, user_id: Optional[str] = None,
@@ -249,7 +334,15 @@ async def _process_frame_and_collect_result_enriched(
                 if embedding is None or face_img is None or face_id is None:
                     continue
                 emotion_tracker.update_face(face_id, face_img, raw_bytes=raw_bytes, frame_ts=time.time())
-    # 3) ничего не считаем, не чистим — это сделает фон
+                FACE_CTX[str(face_id)] = {
+                "device_id": device_id,
+                "user_id": user_id,
+                "lat": lat,
+                "lon": lon,
+                "address": address,
+                "meta": extra_meta or {},
+                "ts": time.time(),
+            }
     return {}
 
 def _strip_data_url_prefix(b64txt: str) -> str:
@@ -328,7 +421,12 @@ async def maybe_notify_alert(source: str, face_id: str, emotion: Dict[str, Any],
                              alert_id: Optional[str] = None,
                              raw_url: Optional[str] = None,
                              face_url: Optional[str] = None,
-                             meta: Optional[Dict[str, Any]] = None):
+                             meta: Optional[Dict[str, Any]] = None,
+                             device_id: Optional[str] = None,
+                             user_id: Optional[str] = None,
+                             lat: Optional[float] = None,
+                             lon: Optional[float] = None,
+                             address: Optional[str] = None):
     try:
         score = float(emotion.get("aggression_score", 0))
     except Exception:
@@ -347,7 +445,17 @@ async def maybe_notify_alert(source: str, face_id: str, emotion: Dict[str, Any],
             "raw_url": raw_url,
             "face_url": face_url,
             "meta": meta or {},
+            "device_id": device_id,
+            "user_id": user_id,
+            "lat": lat,
+            "lon": lon,
+            "address": address,
         }
+
+        # если чего-то не хватает — подтянем из БД по alert_id
+        if alert_id:
+            payload = _enrich_alert_payload_from_db(payload)
+
         await alerts_ws_manager.broadcast(payload)
 
 
@@ -381,9 +489,12 @@ async def _process_frame_and_collect_result(raw_bytes: bytes, source: str) -> di
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+
+    # user_id из токена или из scope (если ws_auth уже положил)
     token = websocket.query_params.get("token")
     claims = _decode_token(token)
-    user_id = claims.get("sub") if claims else None
+    auth = websocket.scope.get("auth", {}) if isinstance(websocket.scope, dict) else {}
+    user_id = (claims.get("sub") if claims else None) or auth.get("user_id")
 
     # держим последние известные метаданные, чтобы использовать при дренажe
     last_lat = last_lon = None
@@ -464,12 +575,17 @@ async def websocket_endpoint(websocket: WebSocket):
             await asyncio.sleep(0.1)
 
 
-
-
 # -------------------- ВЕБСОКЕТ: СТРИМ БАЙТОВ/BASE64 (/ws/stream) --------------------
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
+
+    # user_id из токена или из scope (на случай авторизованных стримов)
+    token = websocket.query_params.get("token")
+    claims = _decode_token(token)
+    auth = websocket.scope.get("auth", {}) if isinstance(websocket.scope, dict) else {}
+    user_id = (claims.get("sub") if claims else None) or auth.get("user_id")
+
     # сюда обычно девайсы не присылают geo, но оставим «последние» поля на будущее
     last_lat = last_lon = None
     last_address = None
@@ -499,7 +615,7 @@ async def websocket_stream(websocket: WebSocket):
 
             result = await _process_frame_and_collect_result_enriched(
                 img_data, source="ws_stream",
-                device_id=last_device_id, user_id=None,
+                device_id=last_device_id, user_id=user_id,
                 lat=last_lat, lon=last_lon, address=last_address, extra_meta=last_meta
             )
             if result:
@@ -509,7 +625,7 @@ async def websocket_stream(websocket: WebSocket):
             logger.info("WS_STREAM disconnected: code=%s reason=%r", getattr(e, "code", None), getattr(e, "reason", None))
             await _flush_pending_buffers(
                 source="ws_stream",
-                device_id=last_device_id, user_id=None,
+                device_id=last_device_id, user_id=user_id,
                 lat=last_lat, lon=last_lon, address=last_address,
                 extra_meta=last_meta,
             )
@@ -518,7 +634,7 @@ async def websocket_stream(websocket: WebSocket):
             logger.info("WS_STREAM runtime closed: %s", e)
             await _flush_pending_buffers(
                 source="ws_stream",
-                device_id=last_device_id, user_id=None,
+                device_id=last_device_id, user_id=user_id,
                 lat=last_lat, lon=last_lon, address=last_address,
                 extra_meta=last_meta,
             )
@@ -532,8 +648,6 @@ async def websocket_stream(websocket: WebSocket):
                 pass
             await _ws_send_json_safe(websocket, {"error": str(e)})
             await asyncio.sleep(0.1)
-
-
 
 
 # -------------------- КАНАЛ УВЕДОМЛЕНИЙ ПО WS --------------------
@@ -560,10 +674,6 @@ async def websocket_alerts(ws: WebSocket):
 
 
 # -------------------- СИСТЕМНЫЕ ЭНДПОИНТЫ --------------------
-@app.on_event("shutdown")
-def shutdown_event():
-    face_recognizer.close()
-
 @app.get("/")
 async def root():
     return {"message": "Бэкенд работает"}

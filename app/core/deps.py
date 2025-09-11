@@ -102,16 +102,49 @@ def get_current_user(
     return user
 
 
-def require_role(*allowed: Iterable[UserRole]):
-    allowed_set = set(allowed or [])
+def require_role(*args):
+    """
+    Универсальная версия:
+    1) Как dependency-фабрика:
+       dependencies=[Depends(require_role(UserRole.admin))]
+       dependencies=[Depends(require_role({UserRole.admin, UserRole.officer}))]
 
-    def dep(user: User = Depends(get_current_user)) -> User:
-        if allowed_set and user.role not in allowed_set:
-            _log("role denied", have=getattr(user.role, "value", user.role), need=[r.value for r in allowed_set])
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    2) Как прямой вызов внутри ручки:
+       require_role(user, {UserRole.admin})
+    """
+    if len(args) == 1:
+        allowed = args[0]
+        if not isinstance(allowed, (set, list, tuple)):
+            allowed = {allowed}
+        allowed = set(allowed)
+
+        def _dep(user=Depends(get_current_user)):
+            if user.role not in allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden",
+                )
+            return user
+
+        return _dep
+
+    elif len(args) == 2:
+        user, allowed = args
+        if not isinstance(allowed, (set, list, tuple)):
+            allowed = {allowed}
+        allowed = set(allowed)
+        if user.role not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden",
+            )
         return user
 
-    return dep
+    else:
+        raise TypeError(
+            "require_role usage: require_role(allowed) for dependency "
+            "or require_role(user, allowed) for direct check"
+        )
 
 
 def get_current_device(

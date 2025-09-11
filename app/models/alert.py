@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Integer, Float, ForeignKey, Text
+from sqlalchemy import Column, String, DateTime, Integer, Float, ForeignKey, Text, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.db.session import Base
 
@@ -11,6 +11,8 @@ class Alert(Base):
     device_id = Column(UUID(as_uuid=True), ForeignKey("devices.id", ondelete="SET NULL"), nullable=True, index=True)
     severity = Column(Integer, nullable=False, default=0)  # 0..10
     label = Column(String(64), nullable=False, default="aggression")
+    hidden = Column(Boolean, nullable=False, default=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     face_id = Column(String(64), nullable=True)  # text to avoid FK to legacy faces table
     emotion = Column(JSONB, nullable=True)      # DeepFace/FER results
     meta = Column(JSONB, nullable=True)         # any extra fields

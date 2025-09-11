@@ -17,7 +17,7 @@ def _media_url(path: Optional[str]) -> Optional[str]:
     if path.startswith("http") or path.startswith("/"):
         return path
     # теперь раздаём под /alerts/*
-    return f"/alerts/{path}"
+    return f"/api/v1/media/alerts/{path}"
 
 
 def _row_get(row_map, *names):
